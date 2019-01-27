@@ -2,10 +2,12 @@ package gohokuyolidar
 
 import (
 	"errors"
+	"log"
 
-	serial "github.com/mikepb/go-serial"
+	"github.com/google/gousb"
 )
 
+// sudo chmod a+rw /dev/ttyACM0
 const (
 	lr          byte = 0x0a
 	cr          byte = 0x0d
@@ -15,46 +17,67 @@ const (
 
 // HokuyoLidar represents the lidar structure
 type HokuyoLidar struct {
-	serialPort *serial.Port
-	portname   string
-	baudrate   int // 750000
-	options    *serial.Options
-	Connected  bool
+	context   *gousb.Context
+	device    *gousb.Device
+	done      func()
+	out       *gousb.OutEndpoint
+	in        *gousb.InEndpoint
+	Connected bool
 }
 
 // NewHokuyoLidar creates an instance of the lidar struct
-func NewHokuyoLidar(portName string, baudrate int) *HokuyoLidar {
-	return &HokuyoLidar{nil, portName, baudrate, nil, false}
+func NewHokuyoLidar() *HokuyoLidar {
+	return &HokuyoLidar{nil, nil, nil, nil, nil, false}
 }
 
 // Connect activates the serial port connection to the lidar
 func (h *HokuyoLidar) Connect() error {
-	if h.serialPort != nil && h.Connected {
+	if h.Connected {
 		err := errors.New("Lidar is already connected")
 		return err
 	}
-	options := serial.RawOptions
-	options.Mode = serial.MODE_READ_WRITE
-	options.BitRate = h.baudrate
-	serialPort, err := options.Open(h.portname)
+
+	ctx := gousb.NewContext()
+	dev, err := ctx.OpenDeviceWithVIDPID(0x15d1, 0x0000)
 	if err != nil {
-		err = errors.New("Failed to open serial port on " + h.portname)
-		return err
+		log.Fatalf("Failed to open device: %v\n", err)
 	}
-	h.options = &options
-	h.serialPort = serialPort
+
+	intf, done, err := dev.DefaultInterface()
+	if err != nil {
+		log.Fatalf("%s.DefaultInterface(): %v\n", dev, err)
+	}
+
+	epout, err := intf.OutEndpoint(7)
+	if err != nil {
+		log.Fatalf("%s.OutEndpoint(7): %v\n", intf, err)
+	}
+
+	epin, err := intf.InEndpoint(6)
+	if err != nil {
+		log.Fatalf("%s.InEndpoint(6): %v\n", intf, err)
+	}
+
+	h.context = ctx
+	h.device = dev
+	h.done = done
+	h.in = epin
+	h.out = epout
+
 	h.Connected = true
 	return nil
 }
 
 // Disconnect disables the serial port connection to the lidar
 func (h *HokuyoLidar) Disconnect() error {
-	if h.serialPort == nil || !h.Connected {
-		return nil
+	if h.Connected {
+		return errors.New("Lidar is already connected")
 	}
-	err := h.serialPort.Close()
+	h.context.Close()
+	h.device.Close()
+	h.done()
 	h.Connected = false
-	return err
+	return nil
 }
 
 // VersionCmd asks the lidar for it's version info
@@ -73,7 +96,7 @@ func (h *HokuyoLidar) VersionCmd() (string, error) {
 
 func (h *HokuyoLidar) sendCommandBlock(req []byte) error {
 	size := len(req)
-	asize, err := h.serialPort.Write(req)
+	asize, err := h.out.Write(req)
 	if size != asize {
 		return errors.New("Failed to send all request bytes")
 	}
@@ -82,7 +105,7 @@ func (h *HokuyoLidar) sendCommandBlock(req []byte) error {
 
 func (h *HokuyoLidar) readUnfixedResponse(size int) (int, []byte, error) {
 	res := make([]byte, size)
-	read, err := h.serialPort.Read(res)
+	read, err := h.in.Read(res)
 	if err != nil {
 		return 0, nil, errors.New("Failed to read from serial port")
 	}
