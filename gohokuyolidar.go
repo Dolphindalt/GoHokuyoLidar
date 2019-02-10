@@ -3,8 +3,13 @@ package gohokuyolidar
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log"
+	"math"
 	"strconv"
+	"strings"
+
+	"github.com/go-gl/mathgl/mgl64"
 
 	serial "github.com/mikepb/go-serial"
 )
@@ -24,9 +29,26 @@ const (
 	sTag          byte = 0x53
 	cTag          byte = 0x43
 	hTag          byte = 0x48
+	gTag          byte = 0x47
+	pTag          byte = 0x56
+	iTag          byte = 0x49
+	vTag          byte = 0x56
 	threeEncoding byte = 0x44
 	twoEncoding   byte = 0x53
+
+	// URG-04LX constants
+	DMIN int = 20
+	DMAX int = 5600
+	ARES int = 1024
+	AMIN int = 44
+	AMAX int = 725
+	AFRT int = 384
+	SCAN int = 600
 )
+
+var angleRange = 360.0 / ARES * AMAX
+var angleMin = -angleRange / 2.0
+var angleMax = angleRange / 2.0
 
 var healthStatus = map[string]string{
 	"00": "Command received without any Error",
@@ -109,25 +131,25 @@ func (h *HokuyoLidar) Disconnect() error {
 
 // S C I P 2 . 0 LF
 // S C I P 2 . 0 LF STATUS LF LF
-func (h *HokuyoLidar) scipTwoCmd() {
+func (h *HokuyoLidar) scipTwoCmd() error {
 	cmd := []byte{'S', 'C', 'I', 'P', '2', '.', '0', lf}
 	err := h.sendCommandBlock(cmd)
 	if err != nil {
-		log.Fatalf("Failed to init scip 2.0 protocol: %v\n", err)
+		return fmt.Errorf("Failed to init scip 2.0 protocol: %v", err)
 	}
 	_, res, err := h.readFixedResponse(13)
 	if err != nil {
-		log.Fatalf("ScipTwoCmd: %v\n", err)
+		return fmt.Errorf("ScipTwoCmd: %v", err)
 	}
 	var buffer bytes.Buffer
 	buffer.Write(res[9:10])
 	statusCode := buffer.String()
 	log.Printf("%v\n", res)
-	statusCheck(statusCode)
+	return statusCheck(statusCode)
 }
 
 // MDMSCmd is a sensor data aquisition command that uses three character encoding or two character encoding.
-func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scanInterval, numberOfScans int, characters string) {
+func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scanInterval, numberOfScans int, characters string) error {
 	// stupid proofing the scan
 	ss := strconv.Itoa(startStep)
 	es := strconv.Itoa(endStep)
@@ -162,15 +184,18 @@ func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scan
 
 	err := h.sendCommandBlock(cmd)
 	if err != nil {
-		log.Fatalf("Encountered error during MD init: %v\n", err)
+		return fmt.Errorf("Encountered error during MD init: %v", err)
 	}
 	headLen := 21 + len(characters)
 	_, head, err := h.readFixedResponse(headLen)
 	if err != nil {
-		log.Fatalf("Err in scan init: %v\n", err)
+		return fmt.Errorf("Err in scan init: %v", err)
 	}
 	statusCode := head[headLen-5 : headLen-3]
-	statusCheck(string(statusCode))
+	err = statusCheck(string(statusCode))
+	if err != nil {
+		return err
+	}
 
 	h.startStep = startStep
 	h.endStep = endStep
@@ -179,6 +204,62 @@ func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scan
 	h.encodingType = threeEncoding
 	h.headSize = headLen
 	h.requestTag = mTag
+	return nil
+}
+
+// GDGSCommand Whenever sensor receives this command it suppliesthe latest
+// measurement data to  the  host. If the laser is switched off, it should
+// be switched on by sending BM-Command before  the  measurement. Laser
+// should be switched off if necessary by sending QT-Command after
+// measurement is complete.
+func (h *HokuyoLidar) GDGSCommand(three bool, startStep, endStep, clusterCount int, characters string) error {
+	ss := strconv.Itoa(startStep)
+	es := strconv.Itoa(endStep)
+	cc := strconv.Itoa(clusterCount)
+
+	zeroPadString(4, &ss)
+	zeroPadString(4, &es)
+	zeroPadString(2, &cc)
+	if len(characters) > 16 {
+		characters = characters[0:16]
+	}
+
+	var encode byte
+	if three {
+		encode = threeEncoding
+	} else {
+		encode = twoEncoding
+	}
+
+	cmd := []byte{gTag, encode}
+	cmd = append(cmd[:], []byte(ss)[:]...)
+	cmd = append(cmd[:], []byte(es)[:]...)
+	cmd = append(cmd[:], []byte(cc)[:]...)
+	cmd = append(cmd[:], []byte(characters)[:]...)
+	cmd = append(cmd[:], lf)
+
+	err := h.sendCommandBlock(cmd)
+	if err != nil {
+		return err
+	}
+	headLen := 18 + len(characters)
+	_, head, err := h.readFixedResponse(headLen)
+	if err != nil {
+		return err
+	}
+	statusCode := head[headLen-5 : headLen-3]
+	err = statusCheck(string(statusCode))
+	if err != nil {
+		return err
+	}
+
+	h.startStep = startStep
+	h.endStep = endStep
+	h.clusterCount = clusterCount
+	h.encodingType = threeEncoding
+	h.headSize = headLen
+	h.requestTag = gTag
+	return nil
 }
 
 // BMCommand will illuminate the sensor’s laser enabling the measurement.
@@ -201,7 +282,7 @@ func (h *HokuyoLidar) BMCommand(chars string) error {
 		return err
 	}
 	statusCode := res[resLen-5 : resLen-3]
-	statusCheck(string(statusCode))
+	err = statusCheck(string(statusCode))
 	return err
 }
 
@@ -378,8 +459,167 @@ func (h *HokuyoLidar) CRCommand(chars string) error {
 	return nil
 }
 
+// PPCommand Sensor transmits its specifications on receiving this command.
+func (h *HokuyoLidar) PPCommand(chars string) ([]string, error) {
+	cmd := []byte{pTag, pTag}
+	cmd = append(cmd[:], []byte(chars)[:]...)
+	cmd = append(cmd, lf)
+	err := h.sendCommandBlock(cmd)
+	if err != nil {
+		return nil, err
+	}
+	_, _, err = h.readFixedResponse(7 + len(chars))
+	if err != nil {
+		return nil, err
+	}
+	stray := []string{}
+	for i := 0; i < 6; i++ {
+		raw := []byte{}
+		var read byte
+		for read != lf {
+			_, res, err := h.readFixedResponse(1)
+			if err != nil {
+				return nil, err
+			}
+			read = res[0]
+			raw = append(raw, res[0])
+		}
+		if raw[0] != lf {
+			rawstr := strings.Split(string(raw), ";")[0]
+			stray = append(stray, rawstr)
+		}
+	}
+	return stray, nil
+}
+
+// IICommand Sensor transmits its running state on receiving this command.
+func (h *HokuyoLidar) IICommand(chars string) ([]string, error) {
+	cmd := []byte{iTag, iTag}
+	cmd = append(cmd[:], []byte(chars)[:]...)
+	cmd = append(cmd, lf)
+	err := h.sendCommandBlock(cmd)
+	if err != nil {
+		return nil, err
+	}
+	_, _, err = h.readFixedResponse(7 + len(chars))
+	if err != nil {
+		return nil, err
+	}
+	stray := []string{}
+	for i := 0; i < 7; i++ {
+		raw := []byte{}
+		var read byte
+		for read != lf {
+			_, res, err := h.readFixedResponse(1)
+			if err != nil {
+				return nil, err
+			}
+			read = res[0]
+			raw = append(raw, res[0])
+		}
+		if raw[0] != lf {
+			rawstr := strings.Split(string(raw), ";")[0]
+			stray = append(stray, rawstr)
+		}
+	}
+	return stray, nil
+}
+
+// VVCommand Sensor transmits version details such as, serial number,
+// firmware version etc on receiving this command.
+func (h *HokuyoLidar) VVCommand(chars string) ([]string, error) {
+	cmd := []byte{vTag, vTag}
+	cmd = append(cmd[:], []byte(chars)[:]...)
+	cmd = append(cmd, lf)
+	err := h.sendCommandBlock(cmd)
+	if err != nil {
+		return nil, err
+	}
+	_, _, err = h.readFixedResponse(7 + len(chars))
+	if err != nil {
+		return nil, err
+	}
+	stray := []string{}
+	for i := 0; i < 5; i++ {
+		raw := []byte{}
+		var read byte
+		for read != lf {
+			_, res, err := h.readFixedResponse(1)
+			if err != nil {
+				return nil, err
+			}
+			read = res[0]
+			raw = append(raw, res[0])
+		}
+		if raw[0] != lf {
+			rawstr := strings.Split(string(raw), ";")[0]
+			stray = append(stray, rawstr)
+		}
+	}
+	return stray, nil
+}
+
+// GetDistance returns a list of distances and a timestamp
+func (h *HokuyoLidar) GetDistance() ([]int, int, error) {
+	var resLen int
+	if h.requestTag == mTag {
+		resLen = 16
+	} else {
+		resLen = h.headSize - 10
+	}
+	_, _, err := h.readFixedResponse(resLen)
+	if err != nil {
+		return nil, 0, err
+	}
+	_, statusAndJunk, err := h.readFixedResponse(4)
+	if err != nil {
+		return nil, 0, err
+	}
+	statusCode := string(statusAndJunk[0:2])
+	err = statusCheck(statusCode)
+	if err != nil {
+		return nil, 0, err
+	}
+	_, encodedTime, err := h.readFixedResponse(6)
+	timestamp := decode(encodedTime[0:4])
+
+	data := []byte{}
+	for {
+		_, chungus, err := h.readFixedResponse(66) // data plus lf lf
+		if err != nil {
+			return nil, 0, fmt.Errorf("Failed to read data chunk during scan: %v", err)
+		}
+		data = append(data[:], chungus[0:len(chungus)-2]...)
+		dataleft := string(chungus[13:15])
+		if dataleft == "00" {
+			break
+		}
+	}
+
+	h.readFixedResponse(1) // lf
+
+	var scanSize int
+	if h.encodingType == threeEncoding {
+		scanSize = 3
+	} else {
+		scanSize = 2
+	}
+
+	distance := []int{}
+	dist := []byte{}
+
+	for _, v := range data {
+		dist = append(dist, v)
+		if len(dist) == scanSize {
+			distance = append(distance, decode(dist))
+			dist = []byte{}
+		}
+	}
+	return distance, timestamp, nil
+}
+
 // GetDistanceAndIntensity returns a list of distances, intensities, and a timestamp
-func (h *HokuyoLidar) GetDistanceAndIntensity() ([]int, []int, int) {
+func (h *HokuyoLidar) GetDistanceAndIntensity() ([]int, []int, int, error) {
 	var resLen int
 	if h.requestTag == 'M' {
 		resLen = int(h.headSize)
@@ -388,25 +628,28 @@ func (h *HokuyoLidar) GetDistanceAndIntensity() ([]int, []int, int) {
 	}
 	_, _, err := h.readFixedResponse(resLen)
 	if err != nil {
-		log.Fatalf("Failed to read reponse header: %v\n", err)
+		return nil, nil, 0, fmt.Errorf("Failed to read reponse header: %v", err)
 	}
 	_, statusAndJunk, err := h.readFixedResponse(4)
 	if err != nil {
-		log.Fatalf("Failed to read status of scan: %v\n", err)
+		return nil, nil, 0, fmt.Errorf("Failed to read status of scan: %v", err)
 	}
 	statusCode := string(statusAndJunk[0:2])
-	statusCheck(statusCode)
+	err = statusCheck(statusCode)
+	if err != nil {
+		return nil, nil, 0, err
+	}
 	_, encodedTime, err := h.readFixedResponse(6)
 	if err != nil {
-		log.Fatalf("Failed to read timestamp: %v\n", err)
+		return nil, nil, 0, fmt.Errorf("Failed to read timestamp: %v", err)
 	}
-	timestamp := decode(encodedTime)
+	timestamp := decode(encodedTime[0:4])
 
 	data := []byte{}
 	for {
 		_, chungus, err := h.readFixedResponse(66) // data plus lf lf
 		if err != nil {
-			log.Fatalf("Failed to read data chunk during scan: %v\n", err)
+			return nil, nil, 0, fmt.Errorf("Failed to read data chunk during scan: %v", err)
 		}
 		data = append(data[:], chungus[0:len(chungus)-2]...)
 		dataleft := string(chungus[13:15])
@@ -435,7 +678,7 @@ func (h *HokuyoLidar) GetDistanceAndIntensity() ([]int, []int, int) {
 		}
 	}
 
-	return distance, intensity, timestamp
+	return distance, intensity, timestamp, nil
 }
 
 func (h *HokuyoLidar) sendCommandBlock(req []byte) error {
@@ -459,14 +702,34 @@ func (h *HokuyoLidar) readFixedResponse(size int) (int, []byte, error) {
 	return read, res, err
 }
 
-func statusCheck(code string) {
+func statusCheck(code string) error {
 	if code == "00" || code == "99" {
-		return
+		return nil
 	} else if _, ok := healthStatus[code]; ok {
-		log.Fatalf("A known error has occured: %v: %v\n", code, healthStatus[code])
+		return fmt.Errorf("A known error has occured: %v: %v", code, healthStatus[code])
 	} else {
-		log.Fatalf("An unknown error has occured: %v\n", code)
+		return fmt.Errorf("An unknown error has occured: %v", code)
 	}
+}
+
+// DataToCartesian converts a distance array from a scan into an array of points.
+func (h *HokuyoLidar) DataToCartesian(distances []int) []mgl64.Vec2 {
+	coords := []mgl64.Vec2{}
+	step := h.step()
+	radians := math.Pi / 180.0
+	for i, v := range distances {
+		if v < 20 {
+			v = 0
+		}
+		theta := float64(angleMin) + float64(i)*step
+		coords = append(coords, mgl64.Vec2{float64(v) * math.Cos(theta*radians), float64(v) * math.Sin(theta*radians)})
+	}
+	return coords
+}
+
+func (h *HokuyoLidar) step() float64 {
+	step := 360.0 / float64(ARES*h.clusterCount)
+	return step * float64(h.scanInterval+1.0)
 }
 
 func zeroPadString(desiredLen int, str *string) {
