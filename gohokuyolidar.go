@@ -17,6 +17,9 @@ const (
 	version       byte = 0x56
 	segmentSize   int  = 65
 	measureTag    byte = 0x4d
+	bTag          byte = 0x42
+	qTag          byte = 0x51
+	tTag          byte = 0x54
 	threeEncoding byte = 0x44
 	twoEncoding   byte = 0x53
 )
@@ -145,7 +148,6 @@ func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scan
 	zeroPadString(2, &cc)
 	zeroPadString(1, &si)
 	zeroPadString(2, &ns)
-	log.Printf("Scans: %v\n", ns)
 	if len(characters) > 16 {
 		characters = characters[0:16]
 	}
@@ -166,7 +168,6 @@ func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scan
 	cmd = append(cmd[:], []byte(characters)[:]...)
 	cmd = append(cmd[:], lf)
 
-	log.Printf("Cmd: %v\n", cmd)
 	err := h.sendCommandBlock(cmd)
 	if err != nil {
 		log.Fatalf("Encountered error during MD init: %v\n", err)
@@ -176,9 +177,7 @@ func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scan
 	if err != nil {
 		log.Fatalf("Err in scan init: %v\n", err)
 	}
-	log.Printf("Data: %v\n", head)
 	statusCode := head[headLen-5 : headLen-3]
-	log.Printf("Status: %v\n", statusCode)
 	statusCheck(string(statusCode))
 
 	h.startStep = startStep
@@ -186,36 +185,71 @@ func (h *HokuyoLidar) MDMSCmd(three bool, startStep, endStep, clusterCount, scan
 	h.clusterCount = clusterCount
 	h.scanInterval = scanInterval
 	h.encodingType = threeEncoding
-	h.headSize = 26
+	h.headSize = headLen
 	h.requestTag = measureTag
+}
+
+// BMCommand will illuminate the sensor’s laser enabling the measurement.
+// When sensor is switched on in SCIP2.0 mode or switched to SCIP2.0 by
+// command the laser is initially in off state by default. In this state
+// sensor can not perform the measurement. Laser state can be verified
+// by green LED on the sensor. Laser is off if the LED blinks rapidly
+// and it is ON when LED glows continuously.
+func (h *HokuyoLidar) BMCommand(chars string) error {
+	cmd := []byte{bTag, measureTag}
+	cmd = append(cmd[:], []byte(chars)[:]...)
+	cmd = append(cmd, lf)
+	err := h.sendCommandBlock(cmd)
+	if err != nil {
+		return err
+	}
+	resLen := len(chars) + 8
+	_, res, err := h.readFixedResponse(resLen)
+	if err != nil {
+		return err
+	}
+	statusCode := res[resLen-5 : resLen-3]
+	statusCheck(string(statusCode))
+	return err
+}
+
+// QMCommand will switch off the laser disabling sensor’s measurement state.
+func (h *HokuyoLidar) QMCommand(chars string) error {
+	cmd := []byte{qTag, tTag}
+	cmd = append(cmd[:], []byte(chars)[:]...)
+	cmd = append(cmd, lf)
+	err := h.sendCommandBlock(cmd)
+	if err != nil {
+		return err
+	}
+	resLen := len(chars) + 8
+	_, _, err = h.readFixedResponse(resLen) // status is always 0 0
+	return err
 }
 
 // GetDistanceAndIntensity returns a list of distances, intensities, and a timestamp
 func (h *HokuyoLidar) GetDistanceAndIntensity() ([]int, []int, int) {
-	log.Printf("t1\n")
-	resLen := int(h.headSize - 10)
+	var resLen int
+	if h.requestTag == 'M' {
+		resLen = int(h.headSize)
+	} else {
+		resLen = int(h.headSize - 10)
+	}
 	_, _, err := h.readFixedResponse(resLen)
 	if err != nil {
 		log.Fatalf("Failed to read reponse header: %v\n", err)
 	}
-	log.Printf("t2\n")
 	_, statusAndJunk, err := h.readFixedResponse(4)
 	if err != nil {
 		log.Fatalf("Failed to read status of scan: %v\n", err)
 	}
-	log.Printf("t3\n")
 	statusCode := string(statusAndJunk[0:2])
 	statusCheck(statusCode)
-	log.Printf("t4\n")
-
 	_, encodedTime, err := h.readFixedResponse(6)
-	log.Printf("t5\n")
 	if err != nil {
 		log.Fatalf("Failed to read timestamp: %v\n", err)
 	}
 	timestamp := decode(encodedTime)
-
-	pointDx := h.endStep - h.startStep + 1
 
 	data := []byte{}
 	for {
@@ -225,24 +259,11 @@ func (h *HokuyoLidar) GetDistanceAndIntensity() ([]int, []int, int) {
 		}
 		data = append(data[:], chungus[0:len(chungus)-2]...)
 		dataleft := string(chungus[13:15])
-		log.Printf("Chungus %v\n", chungus)
-		log.Printf("Data Left %v\n", dataleft)
 		if dataleft == "00" {
 			break
 		}
 	}
 
-	oddball := pointDx * 6 % 64
-	if oddball != 0 { // read remaining data chunk
-		log.Printf("t8\n")
-		_, chungus, err := h.readFixedResponse(oddball + 2)
-		if err != nil {
-			log.Fatalf("Failed to read straggling data chunk during scan: %v\n", err)
-		}
-		data = append(data[:], chungus[0:len(chungus)-2]...)
-	}
-
-	log.Printf("t9\n")
 	h.readFixedResponse(1) // lf
 
 	distance := []int{}
